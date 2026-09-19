@@ -1,92 +1,114 @@
-# Author: maximchinazesov (https://github.com/maximchinazesov-beep)
 import os
 import httpx
 import json
 
 # --- CONFIG ---
 CATEGORIES = ["pets", "eggs", "petwear", "strollers", "food", "vehicles", "toys", "gifts", "stickers"]
-TOKEN = "" # Paste ur token here. [read readme to get it]
+TOKEN = "" # Your Token
 KEYS_TO_DELETE = {"id", "lastUpdatedAt", "origin"}
 
-# --- EXTRACTOR ---
-def extract_array(data, category):
+# --- HYBRID EXTRACTOR ---
+def find_all_items(data):
+    """Рекурсивно ищет все объекты предметов на любом уровне вложенности RSC ответа."""
+    items = []
     if isinstance(data, dict):
-        if category in data and isinstance(data[category], list) and len(data[category]) > 0 and "name" in data[category][0]:
-            return data[category]
-        if "items" in data and isinstance(data["items"], list) and len(data["items"]) > 0 and "name" in data["items"][0]:
-            return data["items"]
-        for val in data.values():
-            res = extract_array(val, category)
-            if res: return res
+        if "name" in data and ("regularValue" in data or "value" in data or "id" in data):
+            items.append(data)
+        else:
+            for val in data.values():
+                items.extend(find_all_items(val))
     elif isinstance(data, list):
         for item in data:
-            res = extract_array(item, category)
-            if res: return res
-    return None
+            items.extend(find_all_items(item))
+    return items
 
 # --- PIPELINE ---
 def main():
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    save_path = os.path.join(script_dir, "amvgg_database.json")
+    save_path = "amvgg_local_test.json"
     
-    final_data = {}
+    final_data = {cat: [] for cat in CATEGORIES}
+    
+    url = f"https://amvgg.com/trades?_rsc={TOKEN}"
 
     with httpx.Client(timeout=15.0) as client:
-        for cat in CATEGORIES:
-            try:
-                url = f"https://amvgg.com/values/{cat}?_rsc={TOKEN}"
-                resp = client.get(url, headers={"User-Agent": "Mozilla/5.0"})
-                
-                json_str = None
-                for line in resp.text.splitlines():
-                    if '{"id":"' in line:
+        try:
+            print(f"[*] Скачиваем единую базу данных...")
+            resp = client.get(url, headers={"User-Agent": "Mozilla/5.0"})
+            resp.raise_for_status()
+            
+            all_raw_items = []
+
+            # RSC
+            for line in resp.text.splitlines():
+                if '{"id":"' in line and '"name":"' in line:
+                    try:
                         json_str = line.split(':', 1)[1] if ':' in line else line
-                        break
+                        parsed_chunk = json.loads(json_str)
                         
-                if not json_str:
-                    print(f"[-] {cat.upper()}: data length pattern not found")
-                    continue
+                        extracted = find_all_items(parsed_chunk)
+                        all_raw_items.extend(extracted)
+                    except json.JSONDecodeError:
+                        continue
 
-                parsed_rsc = json.loads(json_str)
-                items = extract_array(parsed_rsc, cat)
+            if not all_raw_items:
+                print("[-] Не удалось найти предметы. Возможно, токен устарел.")
+                return
+            
+            print(f"[+] Найдено {len(all_raw_items)} сырых предметов. Начинаем распределение...")
+
+            processed_names = set()
+            
+            for item in all_raw_items:
+                name = item.get("name")
+                if not name or name in processed_names:
+                    continue
+                    
+                cat = str(item.get("category", "")).lower()
                 
-                if not items:
-                    print(f"[-] {cat.upper()}: massive not found")
-                    continue
+                if cat + "s" in CATEGORIES:
+                    cat += "s"
+                elif "pet" in cat:
+                    cat = "pets"
+                    
+                if cat not in CATEGORIES:
+                    cat = "pets" 
 
-                cleaned_category = []
-                for item in items:
-                    cleaned_item = {}
-                    for k, v in item.items():
-                        if k in KEYS_TO_DELETE:
-                            continue
-                        if isinstance(v, str):
-                            try:
-                                cleaned_item[k] = float(v) if '.' in v else int(v)
-                            except ValueError:
-                                cleaned_item[k] = v
-                        else:
+                cleaned_item = {}
+                for k, v in item.items():
+                    if k in KEYS_TO_DELETE:
+                        continue
+                    if isinstance(v, str):
+                        try:
+                            cleaned_item[k] = float(v) if '.' in v else int(v)
+                        except ValueError:
                             cleaned_item[k] = v
-                    cleaned_category.append(cleaned_item)
-                
+                    else:
+                        cleaned_item[k] = v
+
+                final_data[cat].append(cleaned_item)
+                processed_names.add(name)
+
+            for cat in list(final_data.keys()):
+                if not final_data[cat]:
+                    del final_data[cat] 
+                    continue
+                    
                 sort_key = "regularValue" if cat == "pets" else "value"
-                
                 def get_val(x):
                     val = x.get(sort_key, 0)
                     return float(val) if val is not None else 0.0
-                    
-                cleaned_category.sort(key=get_val, reverse=True)
-                final_data[cat] = cleaned_category
                 
-                print(f"[+] {cat.upper()}: parsed and cleaned {len(cleaned_category)} шт.")
+                final_data[cat].sort(key=get_val, reverse=True)
+                print(f"[+] {cat.upper()}: обработано {len(final_data[cat])} шт.")
 
-            except Exception as e:
-                print(f"[-] {cat.upper()}: error -> {e}")
+        except Exception as e:
+            print(f"[-] Критическая ошибка: {e}")
+            return
 
     with open(save_path, "w", encoding="utf-8") as f:
         json.dump(final_data, f, ensure_ascii=False, indent=4)
         
-    print(f"\Ready. path: {save_path}")
+    print(f"\n[+] Готово! База сохранена локально: {save_path}")
 
 if __name__ == "__main__":
     main()
